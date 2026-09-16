@@ -1,0 +1,29 @@
+# Core Microsoft Agent Framework (latest, GA) + Azure AI Foundry integration.
+# `agent-framework` pulls in core + all first-party integrations including foundry.
+agent-framework>=1.0.0b251114
+agent-framework-foundry>=1.0.0b251114
+
+# Azure AI Foundry data-plane SDK (project client, model deployments, OpenAI client).
+azure-ai-projects>=2.2.0
+azure-identity>=1.19.0
+
+# MCP protocol client (Streamable HTTP) used by the local MCP client path: the per-user
+# web app and the local-MCP tool factories in databricks_mcp.py.
+mcp>=1.13.0
+
+# Async HTTP transport required by the Foundry async client and MCP tools.
+aiohttp>=3.10.0
+
+# HTTP client used to call the deployed Databricks agent serving endpoint and to
+# carry the Entra ID OAuth bearer token on the local MCP transport.
+httpx>=0.27.0
+
+# Local configuration via .env files.
+python-dotenv>=1.0.1
+
+# Multi-user web UI (foundry_databricks_agent.webapp). Optional — only needed to run the
+# web front end. Equivalent to installing the package's `web` extra: pip install .[web]
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+# Interactive Entra ID sign-in (auth-code flow) for local browser testing of the web UI.
+msal>=1.28.0

@@ -1,0 +1,36 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv
+venv
+ENV
+
+# Python caches and build output
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# VCS and editor state
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# AppOnboard session artifacts and generated infrastructure
+.copilot-azure
+infra
+
+# Docs
+*.md

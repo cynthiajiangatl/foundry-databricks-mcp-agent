@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": { "value": "foundry-dev-19e5" },
+    "location": { "value": "eastus2" },
+    "sessionId": { "value": "19e5e8cc-2de5-45a2-9654-74e96db34e9e" },
+    "deployedBy": { "value": "admin@mngenvmcap150950.onmicrosoft.com" },
+    "createdAt": { "value": "2026-09-16T11:20:42.7022460-04:00" },
+    "deployerObjectId": { "value": "" },
+    "resourceGroupName": { "value": "rg-foundry-dev-19e5" },
+    "containerAppName": { "value": "ca-foundry-dev-19e5" },
+    "containerAppsEnvironmentName": { "value": "cae-foundry-dev-19e5" },
+    "containerRegistryName": { "value": "crfoundrydev19e5" },
+    "managedIdentityName": { "value": "id-foundry-dev-19e5" },
+    "keyVaultName": { "value": "kv-foundry-dev-19e5" },
+    "logAnalyticsWorkspaceName": { "value": "log-foundry-dev-19e5" },
+    "appInsightsName": { "value": "appi-foundry-dev-19e5" },
+    "authTenantId": { "value": "7ec2f66d-b467-4c02-a8c6-4c20748961c5" },
+    "authClientId": { "value": "bdb0e2d4-92f0-4d1c-b421-47f9a4290023" },
+    "foundryProjectEndpoint": { "value": "https://foundrycj1.services.ai.azure.com/api/projects/projectcj1" },
+    "foundryModel": { "value": "gpt-5.6-sol" },
+    "databricksHost": { "value": "https://adb-7405619192018422.2.azuredatabricks.net" },
+    "databricksUcCatalog": { "value": "adbwscj1" },
+    "databricksUcSchema": { "value": "dbdemos_aibi_customer_support" },
+    "databricksGenieSpaceId": { "value": "01f1808744811fc78f0b82f240444c19" }
+  }
+}
