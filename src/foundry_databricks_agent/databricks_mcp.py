@@ -58,6 +58,11 @@ def _make_local_mcp_tool(
         description=description,
         http_client=http_client,
         header_provider=lambda _runtime_kwargs: headers(),
+        # The framework denylists ``conversation_id`` on every MCP call (it reserves the name
+        # for Azure AI tracking). Genie's poll/continue arguments use that exact name, so
+        # without this opt-in every poll fails BAD_REQUEST and the question is re-asked --
+        # re-running SQL on the warehouse.
+        additional_tool_argument_names={"*": ["conversation_id"]},
     )
 
 

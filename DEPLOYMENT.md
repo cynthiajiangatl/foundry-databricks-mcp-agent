@@ -26,6 +26,28 @@ Databricks identity from `WEBAPP_DATABRICKS_IDENTITY`.
 
 ---
 
+## 0. Two ways to deploy
+
+**Infrastructure as code (recommended).** [`infra/main.bicep`](infra/main.bicep) provisions the
+whole stack — managed identity, ACR, Key Vault, Log Analytics + Application Insights, **Cosmos
+DB with its data-plane role assignment**, the Container Apps environment, and the container app
+with EasyAuth and sticky sessions — and wires every environment variable:
+
+```powershell
+az deployment sub create `
+  --location $LOCATION `
+  --template-file infra/main.bicep `
+  --parameters infra/main.parameters.json
+```
+
+Deploy once to create the infrastructure, build and push the image (§6), then redeploy passing
+`containerImage=<acr>.azurecr.io/<app>:latest` to roll it out.
+
+**Step by step with the CLI.** The rest of this guide. Use it to understand each piece, or to
+adapt the solution to an existing estate.
+
+---
+
 ## 1. Prerequisites
 
 - An **Azure subscription** with permission to create resources and assign roles.
@@ -59,8 +81,10 @@ each user signs in with Microsoft Entra ID. Per request:
 | **Model** (Azure AI Foundry) | the **app's managed identity** | `DefaultAzureCredential` |
 | **Databricks** — `obo` mode | the **signed-in user** | On-Behalf-Of exchange of the user's token → Azure Databricks token |
 | **Databricks** — `app` mode | the **app's managed identity** | `DefaultAzureCredential` → Azure Databricks token |
+| **Conversation history** (Cosmos DB) | the **app's managed identity** | `DefaultAzureCredential` → Cosmos **data-plane** RBAC (no account keys) |
 
-The agent is rebuilt per request, so tokens are always fresh.
+The agent is rebuilt per request, so tokens are always fresh. Chat history is loaded from and
+saved back to Cosmos DB on each turn, scoped to the signed-in user.
 
 ---
 
@@ -154,6 +178,42 @@ GRANT EXECUTE     ON ALL FUNCTIONS IN SCHEMA <catalog>.<schema> TO `<app-managed
 - **Genie space**: grant the same identity **CAN RUN** on the Genie space.
 - All identities must be in the **same tenant** as the workspace.
 
+### 3e. Create Cosmos DB for conversation history
+
+Conversation history is stored in Cosmos DB so it survives restarts and is shared across
+replicas. The account is created with **keys disabled** — access is Entra ID only.
+
+```powershell
+$COSMOS = "cosfdagent$((Get-Random))"   # globally unique, lowercase
+
+az cosmosdb create -g $RG -n $COSMOS `
+  --locations regionName=$LOCATION failoverPriority=0 isZoneRedundant=false `
+  --capabilities EnableServerless `
+  --disable-local-auth true `
+  --min-tls-version Tls12
+
+az cosmosdb sql database create -g $RG -a $COSMOS -n agent
+
+# /ownerId is both the tenancy boundary and the partition key; the TTL expires idle chats.
+az cosmosdb sql container create -g $RG -a $COSMOS -d agent -n conversations `
+  --partition-key-path "/ownerId" --ttl 2592000
+
+# Cosmos data-plane access uses its own RBAC system, not Azure RBAC.
+$COSMOS_ID = az cosmosdb show -g $RG -n $COSMOS --query id -o tsv
+az cosmosdb sql role assignment create -g $RG -a $COSMOS `
+  --role-definition-id "00000000-0000-0000-0000-000000000002" `
+  --principal-id $UAMI_PRINCIPAL `
+  --scope $COSMOS_ID
+
+$COSMOS_ENDPOINT = az cosmosdb show -g $RG -n $COSMOS --query documentEndpoint -o tsv
+```
+
+> Assigning the **Azure RBAC** "Cosmos DB Account Reader" or "Contributor" role does **not**
+> grant data access. Only the data-plane role above lets the app read and write documents.
+>
+> For local development, assign the same role to your own `az login` identity. Otherwise leave
+> `COSMOS_ENDPOINT` unset and history stays in process memory.
+
 ---
 
 ## 4. Network considerations
@@ -216,7 +276,13 @@ az containerapp create `
     "WEBAPP_TENANT_ID=<tenant-id>" `
     "WEBAPP_CLIENT_ID=<app-registration-client-id>" `
     "WEBAPP_USE_MANAGED_IDENTITY=1" `
-    "WEBAPP_MANAGED_IDENTITY_CLIENT_ID=$UAMI_CLIENTID"
+    "WEBAPP_MANAGED_IDENTITY_CLIENT_ID=$UAMI_CLIENTID" `
+    "COSMOS_ENDPOINT=$COSMOS_ENDPOINT" `
+    "COSMOS_DATABASE=agent" `
+    "COSMOS_CONTAINER=conversations"
+
+# Keep a user's turns on one replica, which avoids concurrent writes to the same conversation.
+az containerapp ingress sticky-sessions set -g $RG -n $APP --affinity sticky
 ```
 
 Key points:
@@ -293,6 +359,10 @@ Common issues: **tenant mismatch** (`IncorrectClaimException`), in `obo` mode a 
 `app` mode **missing Unity Catalog grants on the app identity**, or a **missing `Azure AI
 User` role** on Foundry for the model.
 
+If chats forget previous turns, check the startup log: `Conversation history: Azure Cosmos DB`
+means it is persisting, while `Conversation history is in-memory` means `COSMOS_ENDPOINT` is
+unset. A `403` from Cosmos means the **data-plane** role assignment (§3e) is missing.
+
 ---
 
 ## 9. Other hosts
@@ -317,6 +387,10 @@ User` role** on Foundry for the model.
 - **HTTPS enforced** — `DATABRICKS_HOST` and `FOUNDRY_PROJECT_ENDPOINT` must be `https://`.
 - **Governance** — Unity Catalog enforces access as the caller; the app never elevates beyond
   what that identity is granted.
+- **Conversation data** — Cosmos DB is created with local auth disabled (Entra ID only),
+  partitioned by the authenticated owner so one user's conversation id cannot reach another's
+  history, and set to expire idle conversations after 30 days. Treat stored conversations as
+  user data subject to your retention and privacy policy.
 - **Private networking** — Private Link / VNet integration and IP access lists; ensure egress
   can reach Databricks.
 - **Image hygiene** — pin a base image digest, scan the image, rebuild to pick up patches.

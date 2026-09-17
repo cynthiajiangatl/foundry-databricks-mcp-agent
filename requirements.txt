@@ -7,6 +7,10 @@ agent-framework-foundry>=1.0.0b251114
 azure-ai-projects>=2.2.0
 azure-identity>=1.19.0
 
+# Durable conversation history for the web app. Authenticated with Entra ID via Cosmos
+# data-plane RBAC; no account keys are used.
+azure-cosmos>=4.9.0
+
 # MCP protocol client (Streamable HTTP) used by the local MCP client path: the per-user
 # web app and the local-MCP tool factories in databricks_mcp.py.
 mcp>=1.13.0

@@ -94,6 +94,13 @@ class Settings:
     uc_schema: str = "default"
     genie_space_id: str | None = None
 
+    # Durable conversation history. When cosmos_endpoint is set the web app keeps agent
+    # sessions in Azure Cosmos DB instead of process memory, so history survives restarts
+    # and is shared across replicas.
+    cosmos_endpoint: str | None = None
+    cosmos_database: str = "agent"
+    cosmos_container: str = "conversations"
+
     # Internal: extra metadata for diagnostics.
     _source: str = field(default="environment", repr=False)
 
@@ -125,6 +132,22 @@ class Settings:
         return f"{self._require_host()}/api/2.0/mcp/genie/{space_id}"
 
     # -- Validation ----------------------------------------------------------
+
+    @property
+    def cosmos_enabled(self) -> bool:
+        """True when durable conversation history is configured."""
+        return bool(self.cosmos_endpoint)
+
+    def validate_cosmos(self) -> None:
+        """Ensure the Cosmos DB settings needed for durable history are usable."""
+        if not self.cosmos_endpoint:
+            raise ConfigError(
+                "COSMOS_ENDPOINT is required to store conversation history in Azure Cosmos DB."
+            )
+        if not self.cosmos_database or not self.cosmos_container:
+            raise ConfigError("COSMOS_DATABASE and COSMOS_CONTAINER must not be empty.")
+        # An Entra token is sent to this endpoint; require TLS.
+        _require_https_authority(self.cosmos_endpoint, "COSMOS_ENDPOINT")
 
     def validate_foundry(self) -> None:
         """Ensure the Foundry settings needed to start an agent are present."""
@@ -188,5 +211,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         uc_catalog=_clean(os.getenv("DATABRICKS_UC_CATALOG")) or "main",
         uc_schema=_clean(os.getenv("DATABRICKS_UC_SCHEMA")) or "default",
         genie_space_id=_clean(os.getenv("DATABRICKS_GENIE_SPACE_ID")),
+        cosmos_endpoint=_clean(os.getenv("COSMOS_ENDPOINT")),
+        cosmos_database=_clean(os.getenv("COSMOS_DATABASE")) or "agent",
+        cosmos_container=_clean(os.getenv("COSMOS_CONTAINER")) or "conversations",
     )
     return settings

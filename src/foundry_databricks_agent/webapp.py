@@ -22,16 +22,20 @@ Run locally (needs the ``web`` extra: ``pip install -e .[web]``)::
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
 import secrets
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from uuid import UUID, uuid4
 
 from azure.core.credentials import AccessToken, TokenCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from .agent import build_local_mcp_agent, response_text
@@ -41,6 +45,8 @@ from .auth import (
     default_credential,
 )
 from .config import ConfigError, load_settings
+from .conversation_store import ConversationCapacityError, ConversationSessionStore
+from .cosmos_store import ConversationConflictError, CosmosConversationSessionStore
 
 
 # Silence the cosmetic "Can't parse tool." warning: the Agent Framework's generic tool
@@ -121,11 +127,51 @@ if _INTERACTIVE:
 
 logger.info("Databricks data-access identity mode: %s", _DATABRICKS_IDENTITY)
 
-app = FastAPI(title="foundry-databricks-agent")
+# Agent Framework conversation sessions, isolated per authenticated user. Swapped for the
+# Cosmos DB-backed store during startup when COSMOS_ENDPOINT is configured.
+_CONVERSATIONS: ConversationSessionStore | CosmosConversationSessionStore = (
+    ConversationSessionStore()
+)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    global _CONVERSATIONS
+
+    settings = load_settings()
+    if settings.cosmos_enabled:
+        settings.validate_cosmos()
+        _CONVERSATIONS = CosmosConversationSessionStore(
+            endpoint=settings.cosmos_endpoint or "",
+            database=settings.cosmos_database,
+            container=settings.cosmos_container,
+        )
+        logger.info(
+            "Conversation history: Azure Cosmos DB (%s/%s)",
+            settings.cosmos_database,
+            settings.cosmos_container,
+        )
+    else:
+        _CONVERSATIONS = ConversationSessionStore()
+        logger.warning(
+            "Conversation history is in-memory and is lost on restart. Set COSMOS_ENDPOINT "
+            "to persist it."
+        )
+
+    try:
+        yield
+    finally:
+        aclose = getattr(_CONVERSATIONS, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+app = FastAPI(title="foundry-databricks-agent", lifespan=_lifespan)
 
 
 class ChatRequest(BaseModel):
     question: str
+    conversation_id: UUID | None = None
 
 
 class _StaticTokenCredential:
@@ -180,6 +226,21 @@ def _user_name(request: Request) -> str:
     if _LOCAL_DEV:
         return "local dev (az login)"
     return "signed-in user"
+
+
+def _conversation_owner(request: Request, assertion: str | None) -> str:
+    """Return a stable isolation key so a conversation id only resolves for its owner."""
+    principal = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID")
+    if request.headers.get("X-MS-TOKEN-AAD-ACCESS-TOKEN") and principal:
+        return f"easyauth:{principal}"
+    sid = request.cookies.get(_SESSION_COOKIE)
+    if sid and sid in _SESSIONS:
+        return f"interactive:{sid}"
+    if assertion:
+        return "bearer:" + hashlib.sha256(assertion.encode("utf-8")).hexdigest()
+    if _LOCAL_DEV:
+        return "local-dev"
+    raise HTTPException(status_code=401, detail="Not signed in.")
 
 
 def _user_databricks_credential(assertion: str | None) -> TokenCredential:
@@ -352,6 +413,18 @@ def auth_logout(request: Request):
     return resp
 
 
+@app.delete("/api/conversations/{conversation_id}", status_code=204)
+async def reset_conversation(request: Request, conversation_id: UUID) -> Response:
+    """Drop one conversation's history so the next question starts from an empty context."""
+    assertion = _user_assertion(request)
+    if not assertion and not _LOCAL_DEV:
+        raise HTTPException(status_code=401, detail="Not signed in.")
+    await _CONVERSATIONS.reset(
+        _conversation_owner(request, assertion), str(conversation_id)
+    )
+    return Response(status_code=204)
+
+
 @app.post("/api/chat")
 async def chat(request: Request, body: ChatRequest) -> dict[str, str]:
     assertion = _user_assertion(request)
@@ -366,6 +439,8 @@ async def chat(request: Request, body: ChatRequest) -> dict[str, str]:
     question = (body.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question must not be empty.")
+    conversation_id = str(body.conversation_id or uuid4())
+    owner_id = _conversation_owner(request, assertion)
 
     try:
         settings = load_settings()
@@ -375,17 +450,28 @@ async def chat(request: Request, body: ChatRequest) -> dict[str, str]:
             "the app identity" if _SHARED_IDENTITY else _user_name(request),
             _DATABRICKS_IDENTITY,
         )
-        async with build_local_mcp_agent(
-            settings, databricks_credential=credential
-        ) as agent:
-            result = await agent.run(question)
+        async with _CONVERSATIONS.session(owner_id, conversation_id) as agent_session:
+            async with build_local_mcp_agent(
+                settings,
+                databricks_credential=credential,
+                conversation_state=agent_session.state,
+            ) as agent:
+                result = await agent.run(question, session=agent_session)
     except ConfigError as exc:
         raise HTTPException(status_code=500, detail=f"Configuration error: {exc}") from exc
+    except ConversationCapacityError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ConversationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
         logger.exception("agent run failed for %s", _user_name(request))
         raise HTTPException(status_code=502, detail=f"Agent error: {exc}") from exc
 
-    return {"user": _user_name(request), "answer": response_text(result)}
+    return {
+        "user": _user_name(request),
+        "answer": response_text(result),
+        "conversation_id": conversation_id,
+    }
 
 
 _INDEX_HTML = """<!doctype html>
@@ -431,6 +517,10 @@ _INDEX_HTML = """<!doctype html>
     .brand .title { font-weight: 650; font-size: 15px; line-height: 1.15; }
     .brand .subtitle { color: var(--muted); font-size: 12px; }
     .who { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+    .icon-btn {
+      width: 34px; height: 34px; padding: 0; display: grid; place-items: center;
+      font-size: 20px; line-height: 1;
+    }
     .pill {
       display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px;
       border-radius: 999px; background: var(--panel-2); color: var(--muted);
@@ -528,6 +618,8 @@ _INDEX_HTML = """<!doctype html>
       </div>
     </div>
     <div class="who">
+      <button id="newChat" class="btn icon-btn" type="button" title="New conversation"
+              aria-label="New conversation" disabled>+</button>
       <span id="statusPill" class="pill"><span class="dot"></span><span id="whoName" class="name">…</span></span>
       <a id="auth" class="btn" href="#" style="display:none"></a>
     </div>
@@ -572,7 +664,10 @@ _INDEX_HTML = """<!doctype html>
     const hint = document.getElementById('hint');
     const main = document.getElementById('main');
     const subtitle = document.getElementById('subtitle');
+    const newChat = document.getElementById('newChat');
     let signedIn = false;
+    let conversationId = localStorage.getItem('fdba_conversation_id') || crypto.randomUUID();
+    localStorage.setItem('fdba_conversation_id', conversationId);
 
     function now() {
       return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -631,6 +726,7 @@ _INDEX_HTML = """<!doctype html>
         if (m.interactive) {
           auth.textContent = 'Sign out'; auth.href = '/auth/logout'; auth.style.display = 'inline-block';
         }
+        newChat.disabled = false;
         setEnabled(true); q.focus();
       } else {
         whoName.textContent = 'Not signed in';
@@ -652,6 +748,17 @@ _INDEX_HTML = """<!doctype html>
       q.value = chip.textContent.trim(); autoGrow(); q.focus();
     });
 
+    newChat.addEventListener('click', async () => {
+      const previous = conversationId;
+      conversationId = crypto.randomUUID();
+      localStorage.setItem('fdba_conversation_id', conversationId);
+      try {
+        await fetch('/api/conversations/' + encodeURIComponent(previous), { method: 'DELETE' });
+      } finally {
+        window.location.reload();
+      }
+    });
+
     async function submit() {
       const text = q.value.trim();
       if (!text || send.disabled) return;
@@ -663,11 +770,17 @@ _INDEX_HTML = """<!doctype html>
         const r = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: text })
+          body: JSON.stringify({ question: text, conversation_id: conversationId })
         });
         const data = await r.json().catch(() => ({}));
         typing.remove();
-        if (r.ok) addMessage(data.answer || '(no answer)', 'agent');
+        if (r.ok) {
+          if (data.conversation_id) {
+            conversationId = data.conversation_id;
+            localStorage.setItem('fdba_conversation_id', conversationId);
+          }
+          addMessage(data.answer || '(no answer)', 'agent');
+        }
         else addMessage(data.detail || r.statusText || 'Request failed', 'err');
       } catch (err) {
         typing.remove();

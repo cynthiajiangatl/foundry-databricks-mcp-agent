@@ -17,37 +17,47 @@ It supports **two multi-user use cases**, chosen by a single environment variabl
 In **both** modes the **model** call to Azure AI Foundry always runs as the **app's managed
 identity**, and users always sign in with Microsoft Entra ID.
 
+Conversations are **multi-turn**: each user's chat history is kept in a Microsoft Agent
+Framework session and persisted to **Azure Cosmos DB**, so it survives restarts and is shared
+across replicas.
+
 ---
 
 ## Architecture
 
 ```
      Browser (end user) ── sign in (Entra ID / EasyAuth) ──► user token
-        │  ask a question
+        │  ask a question (+ conversation id)
         ▼
   ┌────────────────────────────────────────────────┐
   │  Web app · webapp.py (FastAPI)                  │
   │  Microsoft Agent Framework Agent                │
   │  (build_local_mcp_agent, runs in this process)  │
-  └───────────────┬────────────────────┬───────────┘
-     model turn   │                    │  UC functions + Genie (local MCP client)
-     as the APP   │                    │  as the OBO user  (obo mode)  OR
-     (managed id) │                    │  as the APP       (app mode)
-                  ▼                    ▼
-      ┌────────────────────┐   ┌────────────────────────────────┐
-      │  Azure AI Foundry  │   │  Azure Databricks · managed MCP │
-      │  • model           │   │  governed by Unity Catalog      │
-      └────────────────────┘   │   ├─ /api/2.0/mcp/functions/…   │
-                               │   └─ /api/2.0/mcp/genie/…       │
-                               └────────────────────────────────┘
+  └──┬───────────────┬────────────────────┬────────┘
+     │ history       │  model turn        │  UC functions + ask_genie
+     │ (AgentSession)│  as the APP        │  as the OBO user (obo mode) OR
+     │               │  (managed id)      │  as the APP       (app mode)
+     ▼               ▼                    ▼
+ ┌─────────────┐ ┌────────────────────┐ ┌────────────────────────────────┐
+ │ Azure       │ │  Azure AI Foundry  │ │  Azure Databricks · managed MCP │
+ │ Cosmos DB   │ │  • model           │ │  governed by Unity Catalog      │
+ │ • sessions  │ └────────────────────┘ │   ├─ /api/2.0/mcp/functions/…   │
+ └─────────────┘                        │   └─ /api/2.0/mcp/genie/…       │
+                                        └────────────────────────────────┘
 ```
 
 - The agent is a Microsoft Agent Framework `Agent` backed by `FoundryChatClient`, built by
   [`build_local_mcp_agent`](src/foundry_databricks_agent/agent.py). Its run loop executes in
   the web app process.
-- **Unity Catalog functions** and **Genie** are reached as **local MCP-client** tools
+- **Unity Catalog functions** are reached as **local MCP-client** tools
   (`MCPStreamableHTTPTool`): the app process connects to the Databricks managed MCP servers
   directly and attaches a Microsoft Entra ID OAuth bearer token, refreshed per call.
+- **Genie** is exposed to the model as a single `ask_genie` tool
+  ([`genie.py`](src/foundry_databricks_agent/genie.py)). Genie answers asynchronously, and that
+  ask/poll cycle runs *inside* the tool call rather than being driven by the model — see
+  [Conversation history and efficiency](#conversation-history-and-efficiency).
+- Chat history lives in an `AgentSession` per user and conversation, persisted to **Azure
+  Cosmos DB** when `COSMOS_ENDPOINT` is set (in-process memory otherwise).
 - The **model** always authenticates as the **app's managed identity**
   (`DefaultAzureCredential`). The **Databricks** tools authenticate with the credential the
   request handler passes — the signed-in user (OBO) or the app identity — per the mode.
@@ -78,11 +88,18 @@ foundry-databricks-mcp-agent/
 ├── requirements.txt
 ├── pyproject.toml
 ├── .env.example
+├── infra/                         # Bicep: the whole stack, including Cosmos DB
+│   ├── main.bicep
+│   └── modules/
+├── tests/                         # unit tests (no Azure or Databricks needed)
 └── src/foundry_databricks_agent/
     ├── config.py                 # env-based settings + managed-MCP URL builders
     ├── auth.py                   # centralized Entra ID OAuth (tokens + OBO credential)
     ├── databricks_mcp.py         # local MCP-client tool factories (UC functions, Genie)
-    ├── agent.py                  # builds the Agent Framework agent + tools
+    ├── genie.py                  # single-call ask_genie tool (runs Genie's ask/poll cycle)
+    ├── agent.py                  # builds the Agent Framework agent + tools + history
+    ├── conversation_store.py     # in-memory session store (local dev fallback)
+    ├── cosmos_store.py           # durable session store backed by Azure Cosmos DB
     └── webapp.py                 # multi-user FastAPI web app (obo | app identity modes)
 ```
 
@@ -96,6 +113,8 @@ foundry-databricks-mcp-agent/
 - An **Azure Databricks** workspace with:
   - Unity Catalog functions in some `catalog.schema`,
   - (optional) a **Genie space**.
+- *(optional)* An **Azure Cosmos DB** account (NoSQL API) for durable conversation history.
+  Without it the app still runs, but history is kept in memory and lost on restart.
 - **Microsoft Entra ID** identities:
   - the **app's** managed identity (in Azure) or your `az login` session (local dev) for the
     model, and
@@ -139,6 +158,8 @@ az login
 | `DATABRICKS_UC_CATALOG` / `DATABRICKS_UC_SCHEMA` | Unity Catalog functions location |
 | `DATABRICKS_GENIE_SPACE_ID` | *(optional)* Genie space id (enables the Genie tool) |
 | `WEBAPP_DATABRICKS_IDENTITY` | `obo` (default) or `app` — the Databricks data-access identity |
+| `COSMOS_ENDPOINT` | *(optional)* Cosmos DB account endpoint for durable conversation history. Unset = in-memory (lost on restart) |
+| `COSMOS_DATABASE` / `COSMOS_CONTAINER` | Cosmos database / container names (default `agent` / `conversations`) |
 
 `DATABRICKS_HOST` and `FOUNDRY_PROJECT_ENDPOINT` must be HTTPS (a bearer token is sent to
 them), and URL path segments (catalog, schema, Genie space id) are validated to block
@@ -218,6 +239,38 @@ present (it returns 401), so per-user governance can't be silently bypassed.
 
 ---
 
+## Conversation history and efficiency
+
+Each chat is a Microsoft Agent Framework `AgentSession` keyed by **(signed-in user,
+conversation id)**. The browser supplies the conversation id, but the server always scopes it
+to the authenticated owner, so an id alone never grants access to a conversation.
+
+| Concern | How it is handled |
+| --- | --- |
+| Where history lives | `AgentSession` state, saved each turn to Cosmos DB when `COSMOS_ENDPOINT` is set; process memory otherwise |
+| Isolation | The Cosmos partition key is the authenticated owner; turns in one conversation are serialized |
+| Growth | `ToolResultCompactionStrategy` collapses older tool results so the prompt cannot grow without bound |
+| Expiry | A 30-day Cosmos TTL removes idle conversations automatically |
+| Reset | `DELETE /api/conversations/{id}`, or the **+** button in the UI |
+
+Two design choices keep both token spend and Databricks compute down:
+
+- **Genie runs as a single tool call.** Genie answers asynchronously (`query_space` →
+  `poll_response`). Letting the *model* drive that loop costs a full model call per poll, and a
+  failed poll tends to make the model re-ask the question — which re-runs the SQL on the
+  warehouse. `ask_genie` performs the loop internally and returns only the answer plus a bounded
+  result preview; the generated SQL and result manifests are logged rather than sent to the model.
+- **History is kept local, not service-side.** The agent sets `store=False`, because Foundry's
+  service-managed history bypasses local history providers and would leave compaction with
+  nothing to trim.
+
+> **Gotcha:** the Agent Framework reserves `conversation_id` on MCP tool calls and strips it by
+> default, which breaks Genie's polling and causes repeat questions. The managed MCP tools opt
+> it back in with `additional_tool_argument_names`; removing that will return `BAD_REQUEST` on
+> every poll.
+
+---
+
 ## Security
 
 - **No secrets in the app.** Entra ID OAuth only — no PATs, no Databricks CLI profiles, no
@@ -236,6 +289,10 @@ present (it returns 401), so per-user governance can't be silently bypassed.
   headers, or configuration.
 - **Token hygiene.** Entra tokens are short-lived, cached in memory only, refreshed before
   expiry, and never logged. Session tokens are kept in a server-side store, out of cookies.
+- **Conversation isolation.** Stored conversations are partitioned by the authenticated owner
+  and can only be loaded under that identity, so a conversation id from one user can never
+  resolve into another user's history. Cosmos DB is reached with Entra ID only (account keys
+  are disabled), and conversations expire automatically via a 30-day TTL.
 - **Local hygiene.** `.env` is git-ignored; `.env.example` contains no secrets.
 
 ---
@@ -245,7 +302,11 @@ present (it returns 401), so per-user governance can't be silently bypassed.
 | Capability | Code | SDK surface |
 | --- | --- | --- |
 | Agent (client-side run loop) | `agent.build_local_mcp_agent` | `agent_framework.Agent` + `agent_framework.foundry.FoundryChatClient` |
-| UC functions / Genie tools | `databricks_mcp.make_*_local_mcp_tool` | `agent_framework.MCPStreamableHTTPTool` |
+| UC functions tools | `databricks_mcp.make_uc_functions_local_mcp_tool` | `agent_framework.MCPStreamableHTTPTool` |
+| Genie as one tool call | `genie.make_genie_tool` | `agent_framework.FunctionTool` wrapping `MCPStreamableHTTPTool.call_tool` |
+| Conversation history | `conversation_store` / `cosmos_store` | `agent_framework.AgentSession` + `InMemoryHistoryProvider` |
+| History size control | `agent.build_local_mcp_agent` | `agent_framework.CompactionProvider` + `ToolResultCompactionStrategy` |
+| Durable session storage | `cosmos_store.CosmosConversationSessionStore` | `azure.cosmos.aio` + `azure.identity.aio` |
 | Model auth (app) | `auth.default_credential` | Microsoft Entra ID OAuth via `azure-identity` (`DefaultAzureCredential`) |
 | Databricks token / headers | `auth.databricks_auth_headers` / `auth.token_header_provider` | Entra ID OAuth bearer token (`TokenCredential.get_token`) |
 | Per-user On-Behalf-Of | `auth.build_on_behalf_of_credential` | `azure.identity.OnBehalfOfCredential` (secretless via federated credential) |
@@ -262,6 +323,9 @@ present (it returns 401), so per-user governance can't be silently bypassed.
   `app` mode the app's managed identity needs the Unity Catalog grants.
 - **Tenant match:** Azure Databricks only accepts Entra tokens issued by its own tenant — the
   workspace and the signing identity must share a tenant (`IncorrectClaimException` otherwise).
-- **Genie is asynchronous** (ask → poll); the managed MCP server and agent handle the polling.
+- **Genie is asynchronous** (ask → poll). The `ask_genie` tool runs that cycle internally with
+  bounded backoff, so the model makes one tool call and never polls.
+- **Genie follow-ups** reuse the Genie `conversation_id` stored in the session, so a follow-up
+  continues the existing Genie conversation instead of re-running the same analysis.
 - **Verify identity:** `GET /api/whoami` returns the non-sensitive claims of the Databricks
   token the tools use, plus `identityMode`, so you can confirm which identity Databricks sees.

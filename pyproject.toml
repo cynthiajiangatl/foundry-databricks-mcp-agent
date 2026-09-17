@@ -14,6 +14,7 @@ dependencies = [
     "agent-framework-foundry>=1.0.0b251114",
     "azure-ai-projects>=2.2.0",
     "azure-identity>=1.19.0",
+    "azure-cosmos>=4.9.0",
     "mcp>=1.13.0",
     "aiohttp>=3.10.0",
     "httpx>=0.27.0",

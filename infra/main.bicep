@@ -50,6 +50,7 @@ param managedIdentityName string = 'id-foundry-dev-19e5'
 param keyVaultName string = 'kv-foundry-dev-19e5'
 param logAnalyticsWorkspaceName string = 'log-foundry-dev-19e5'
 param appInsightsName string = 'appi-foundry-dev-19e5'
+param cosmosAccountName string = 'cos-foundry-dev-19e5'
 
 var tags = {
   'app-onboard-skill': 'true'
@@ -117,6 +118,17 @@ module keyVault './modules/key-vault.bicep' = {
   }
 }
 
+module cosmos './modules/cosmos-db.bicep' = {
+  name: 'cosmos-db'
+  scope: rg
+  params: {
+    name: cosmosAccountName
+    location: location
+    tags: tags
+    appPrincipalId: managedIdentity.outputs.principalId
+  }
+}
+
 module containerAppsEnvironment './modules/container-apps-environment.bicep' = {
   name: 'container-apps-environment'
   scope: rg
@@ -165,6 +177,9 @@ module containerApp './modules/container-app.bicep' = {
     databricksUcSchema: databricksUcSchema
     databricksGenieSpaceId: databricksGenieSpaceId
     databricksIdentityMode: 'obo'
+    cosmosEndpoint: cosmos.outputs.endpoint
+    cosmosDatabase: cosmos.outputs.databaseName
+    cosmosContainer: cosmos.outputs.containerName
   }
   dependsOn: [
     roleAssignments
@@ -179,6 +194,8 @@ output AZURE_CONTAINER_APP_NAME string = containerApp.outputs.name
 output AZURE_CONTAINER_APP_FQDN string = containerApp.outputs.fqdn
 output AZURE_CONTAINER_APP_URI string = containerApp.outputs.uri
 output AZURE_KEY_VAULT_NAME string = keyVault.outputs.name
+output AZURE_COSMOS_ACCOUNT_NAME string = cosmos.outputs.accountName
+output AZURE_COSMOS_ENDPOINT string = cosmos.outputs.endpoint
 output AZURE_MANAGED_IDENTITY_NAME string = managedIdentity.outputs.name
 output AZURE_MANAGED_IDENTITY_CLIENT_ID string = managedIdentity.outputs.clientId
 output AZURE_MANAGED_IDENTITY_PRINCIPAL_ID string = managedIdentity.outputs.principalId

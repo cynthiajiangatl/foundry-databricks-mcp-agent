@@ -47,6 +47,15 @@ param databricksUcCatalog string
 param databricksUcSchema string
 param databricksGenieSpaceId string
 
+@description('Cosmos DB account endpoint holding conversation history.')
+param cosmosEndpoint string
+
+@description('Cosmos DB database holding conversation history.')
+param cosmosDatabase string
+
+@description('Cosmos DB container holding conversation history.')
+param cosmosContainer string
+
 @allowed([
   'obo'
   'app'
@@ -77,6 +86,11 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = {
         targetPort: effectivePort
         transport: 'auto'
         allowInsecure: false
+        // Conversation history is durable in Cosmos DB, so affinity is not required for
+        // correctness; it keeps a user's turns on one replica and avoids write conflicts.
+        stickySessions: {
+          affinity: 'sticky'
+        }
         traffic: [
           {
             latestRevision: true
@@ -160,6 +174,18 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = {
             {
               name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
               value: appInsightsConnectionString
+            }
+            {
+              name: 'COSMOS_ENDPOINT'
+              value: cosmosEndpoint
+            }
+            {
+              name: 'COSMOS_DATABASE'
+              value: cosmosDatabase
+            }
+            {
+              name: 'COSMOS_CONTAINER'
+              value: cosmosContainer
             }
           ]
           probes: isPlaceholder ? [] : [

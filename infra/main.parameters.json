@@ -16,6 +16,7 @@
     "keyVaultName": { "value": "kv-foundry-dev-19e5" },
     "logAnalyticsWorkspaceName": { "value": "log-foundry-dev-19e5" },
     "appInsightsName": { "value": "appi-foundry-dev-19e5" },
+    "cosmosAccountName": { "value": "cos-foundry-dev-19e5" },
     "authTenantId": { "value": "7ec2f66d-b467-4c02-a8c6-4c20748961c5" },
     "authClientId": { "value": "bdb0e2d4-92f0-4d1c-b421-47f9a4290023" },
     "foundryProjectEndpoint": { "value": "https://foundrycj1.services.ai.azure.com/api/projects/projectcj1" },
