@@ -94,12 +94,31 @@ class Settings:
     uc_schema: str = "default"
     genie_space_id: str | None = None
 
+    # Lakebase (Databricks OLTP Postgres). Optional; enables the read-only Lakebase tools.
+    # The endpoint is the full resource name: projects/<p>/branches/<b>/endpoints/<e>
+    lakebase_endpoint: str | None = None
+    lakebase_host: str | None = None
+    lakebase_database: str = "databricks_postgres"
+    lakebase_port: int = 5432
+
     # Durable conversation history. When cosmos_endpoint is set the web app keeps agent
     # sessions in Azure Cosmos DB instead of process memory, so history survives restarts
     # and is shared across replicas.
     cosmos_endpoint: str | None = None
     cosmos_database: str = "agent"
     cosmos_container: str = "conversations"
+
+    # OpenTelemetry tracing of agent runs, model calls and tool calls. Exactly one provider
+    # is installed per signal, so the destinations are tried in priority order:
+    # Application Insights -> OTLP endpoint -> Foundry Toolkit (VS Code) -> console.
+    applicationinsights_connection_string: str | None = None
+    otlp_endpoint: str | None = None
+    vs_code_extension_port: int | None = None
+    otel_service_name: str = "foundry-databricks-agent"
+    # Records prompts, completions and tool arguments on spans. Off by default because those
+    # payloads can contain governed Databricks data and user PII.
+    enable_sensitive_telemetry: bool = False
+    enable_console_telemetry: bool = False
 
     # Internal: extra metadata for diagnostics.
     _source: str = field(default="environment", repr=False)
@@ -137,6 +156,42 @@ class Settings:
     def cosmos_enabled(self) -> bool:
         """True when durable conversation history is configured."""
         return bool(self.cosmos_endpoint)
+
+    @property
+    def lakebase_enabled(self) -> bool:
+        """True when the Lakebase (Postgres) tools are configured."""
+        return bool(self.lakebase_endpoint and self.lakebase_host)
+
+    @property
+    def tracing_enabled(self) -> bool:
+        """True when at least one telemetry destination is configured."""
+        return bool(
+            self.applicationinsights_connection_string
+            or self.otlp_endpoint
+            or self.vs_code_extension_port
+            or self.enable_console_telemetry
+        )
+
+    def validate_lakebase(self) -> None:
+        """Ensure the Lakebase settings needed to open a Postgres connection are usable."""
+        missing = [
+            name
+            for name, value in (
+                ("DATABRICKS_LAKEBASE_ENDPOINT", self.lakebase_endpoint),
+                ("DATABRICKS_LAKEBASE_HOST", self.lakebase_host),
+            )
+            if not value
+        ]
+        if missing:
+            raise ConfigError(
+                "Missing required Lakebase configuration: " + ", ".join(missing)
+            )
+        host = self.lakebase_host or ""
+        if "/" in host or any(ch.isspace() for ch in host):
+            raise ConfigError(
+                "DATABRICKS_LAKEBASE_HOST must be a bare hostname, not a URL "
+                f"(got {host!r})."
+            )
 
     def validate_cosmos(self) -> None:
         """Ensure the Cosmos DB settings needed for durable history are usable."""
@@ -186,6 +241,25 @@ class Settings:
         self._require_host()
 
 
+def _flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable."""
+    raw = _clean(os.getenv(name))
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _int_or_none(name: str) -> int | None:
+    """Read an optional integer environment variable, ignoring blanks."""
+    raw = _clean(os.getenv(name))
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer (got {raw!r}).") from exc
+
+
 def load_settings(env_file: str | None = None) -> Settings:
     """Load :class:`Settings` from the environment (and optional ``.env`` file).
 
@@ -211,8 +285,21 @@ def load_settings(env_file: str | None = None) -> Settings:
         uc_catalog=_clean(os.getenv("DATABRICKS_UC_CATALOG")) or "main",
         uc_schema=_clean(os.getenv("DATABRICKS_UC_SCHEMA")) or "default",
         genie_space_id=_clean(os.getenv("DATABRICKS_GENIE_SPACE_ID")),
+        lakebase_endpoint=_clean(os.getenv("DATABRICKS_LAKEBASE_ENDPOINT")),
+        lakebase_host=_clean(os.getenv("DATABRICKS_LAKEBASE_HOST")),
+        lakebase_database=_clean(os.getenv("DATABRICKS_LAKEBASE_DATABASE"))
+        or "databricks_postgres",
+        lakebase_port=int(_clean(os.getenv("DATABRICKS_LAKEBASE_PORT")) or "5432"),
         cosmos_endpoint=_clean(os.getenv("COSMOS_ENDPOINT")),
         cosmos_database=_clean(os.getenv("COSMOS_DATABASE")) or "agent",
         cosmos_container=_clean(os.getenv("COSMOS_CONTAINER")) or "conversations",
+        applicationinsights_connection_string=_clean(
+            os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
+        ),
+        otlp_endpoint=_clean(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
+        vs_code_extension_port=_int_or_none("VS_CODE_EXTENSION_PORT"),
+        otel_service_name=_clean(os.getenv("OTEL_SERVICE_NAME")) or "foundry-databricks-agent",
+        enable_sensitive_telemetry=_flag("ENABLE_SENSITIVE_DATA"),
+        enable_console_telemetry=_flag("ENABLE_CONSOLE_EXPORTERS"),
     )
     return settings

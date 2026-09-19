@@ -24,6 +24,8 @@
     "databricksHost": { "value": "https://adb-7405619192018422.2.azuredatabricks.net" },
     "databricksUcCatalog": { "value": "adbwscj1" },
     "databricksUcSchema": { "value": "dbdemos_aibi_customer_support" },
-    "databricksGenieSpaceId": { "value": "01f1808744811fc78f0b82f240444c19" }
+    "databricksGenieSpaceId": { "value": "01f1808744811fc78f0b82f240444c19" },
+    "databricksLakebaseEndpoint": { "value": "projects/lakebaseproject1/branches/production/endpoints/primary" },
+    "databricksLakebaseHost": { "value": "ep-twilight-rice-e1ipdt0o.database.eastus2.azuredatabricks.net" }
   }
 }

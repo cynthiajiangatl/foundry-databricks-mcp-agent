@@ -43,6 +43,9 @@ az deployment sub create `
 Deploy once to create the infrastructure, build and push the image (§6), then redeploy passing
 `containerImage=<acr>.azurecr.io/<app>:latest` to roll it out.
 
+This path sets `APPLICATIONINSIGHTS_CONNECTION_STRING` on the container app, so tracing of
+agent runs, model calls and tool calls is on as soon as the image is deployed — no extra step.
+
 **Step by step with the CLI.** The rest of this guide. Use it to understand each piece, or to
 adapt the solution to an existing estate.
 
@@ -55,6 +58,8 @@ adapt the solution to an existing estate.
   deployment name).
 - An **Azure Databricks** workspace in the **same Microsoft Entra tenant** as the identities
   used (Azure Databricks only accepts Entra tokens issued by its own tenant).
+- *(optional)* An **Application Insights** component for tracing agent runs, model calls and
+  tool calls. Created in §3f below; the Bicep deployment creates it for you.
 - **Azure CLI** (`az`) and **Docker** (or rely on `az acr build`).
 - The **Databricks CLI** (`databricks`) to grant Unity Catalog access.
 
@@ -82,6 +87,7 @@ each user signs in with Microsoft Entra ID. Per request:
 | **Databricks** — `obo` mode | the **signed-in user** | On-Behalf-Of exchange of the user's token → Azure Databricks token |
 | **Databricks** — `app` mode | the **app's managed identity** | `DefaultAzureCredential` → Azure Databricks token |
 | **Conversation history** (Cosmos DB) | the **app's managed identity** | `DefaultAzureCredential` → Cosmos **data-plane** RBAC (no account keys) |
+| **Telemetry** (Application Insights) | n/a — connection-string ingestion | OpenTelemetry via `APPLICATIONINSIGHTS_CONNECTION_STRING` |
 
 The agent is rebuilt per request, so tokens are always fresh. Chat history is loaded from and
 saved back to Cosmos DB on each turn, scoped to the signed-in user.
@@ -176,6 +182,11 @@ GRANT EXECUTE     ON ALL FUNCTIONS IN SCHEMA <catalog>.<schema> TO `<app-managed
 ```
 
 - **Genie space**: grant the same identity **CAN RUN** on the Genie space.
+- **Lakebase**: Unity Catalog grants do not apply. Create a Postgres role for each identity in
+  the Lakebase SQL editor and grant it read access, for example
+  `select databricks_create_role('<upn-or-client-id>', 'USER')` (use `'SERVICE_PRINCIPAL'` and
+  the client id in `app` mode), then `GRANT CONNECT`, `USAGE` and `SELECT`. The app only ever
+  issues read-only queries.
 - All identities must be in the **same tenant** as the workspace.
 
 ### 3e. Create Cosmos DB for conversation history
@@ -213,6 +224,32 @@ $COSMOS_ENDPOINT = az cosmosdb show -g $RG -n $COSMOS --query documentEndpoint -
 >
 > For local development, assign the same role to your own `az login` identity. Otherwise leave
 > `COSMOS_ENDPOINT` unset and history stays in process memory.
+
+### 3f. Create Application Insights for tracing (optional)
+
+The Agent Framework instruments itself, so with a connection string set the app exports a
+span per agent run, model call and tool call — including which Databricks tool was chosen and
+where a turn failed. Skip this and the app still runs; it just logs that tracing is disabled.
+
+```powershell
+az extension add --name application-insights --upgrade
+
+$LAW  = "log-foundry-databricks-agent"
+$APPI = "appi-foundry-databricks-agent"
+
+az monitor log-analytics workspace create -g $RG -n $LAW -l $LOCATION
+$LAW_ID = az monitor log-analytics workspace show -g $RG -n $LAW --query id -o tsv
+
+az monitor app-insights component create -g $RG -a $APPI -l $LOCATION `
+  --workspace $LAW_ID --application-type web
+
+$APPI_CONNSTR = az monitor app-insights component show -g $RG -a $APPI `
+  --query connectionString -o tsv
+```
+
+> The image must include the tracing extra — the [`Dockerfile`](Dockerfile) installs
+> `.[web,tracing]`, so this works out of the box. Ingestion uses the connection string; the
+> managed identity needs no role for telemetry.
 
 ---
 
@@ -272,6 +309,8 @@ az containerapp create `
     "DATABRICKS_UC_CATALOG=<catalog>" `
     "DATABRICKS_UC_SCHEMA=<schema>" `
     "DATABRICKS_GENIE_SPACE_ID=<genie-space-id>" `
+    "DATABRICKS_LAKEBASE_ENDPOINT=projects/<project>/branches/<branch>/endpoints/<endpoint>" `
+    "DATABRICKS_LAKEBASE_HOST=<endpoint-id>.database.<region>.azuredatabricks.net" `
     "WEBAPP_DATABRICKS_IDENTITY=obo" `
     "WEBAPP_TENANT_ID=<tenant-id>" `
     "WEBAPP_CLIENT_ID=<app-registration-client-id>" `
@@ -279,7 +318,9 @@ az containerapp create `
     "WEBAPP_MANAGED_IDENTITY_CLIENT_ID=$UAMI_CLIENTID" `
     "COSMOS_ENDPOINT=$COSMOS_ENDPOINT" `
     "COSMOS_DATABASE=agent" `
-    "COSMOS_CONTAINER=conversations"
+    "COSMOS_CONTAINER=conversations" `
+    "APPLICATIONINSIGHTS_CONNECTION_STRING=$APPI_CONNSTR" `
+    "OTEL_SERVICE_NAME=foundry-databricks-agent"
 
 # Keep a user's turns on one replica, which avoids concurrent writes to the same conversation.
 az containerapp ingress sticky-sessions set -g $RG -n $APP --affinity sticky
@@ -296,6 +337,10 @@ Key points:
   - For **`obo` mode** with a client secret instead of the federated credential, drop the two
     managed-identity vars and add `--secrets "webapp-client-secret=<secret>"` plus
     `"WEBAPP_CLIENT_SECRET=secretref:webapp-client-secret"`.
+  - The mode also changes **what the UI reveals**: the per-answer "How I got this" panel
+    (the queries run and the rows returned) is served only in `obo` mode, where the caller
+    already owns that data. In `app` mode the server omits it entirely, because every user
+    shares the app's permissions.
 - Grant the UAMI **AcrPull** on the registry so it can pull the image:
 
   ```powershell
@@ -303,6 +348,11 @@ Key points:
   az role assignment create --assignee-object-id $UAMI_PRINCIPAL `
     --assignee-principal-type ServicePrincipal --role AcrPull --scope $ACR_ID
   ```
+
+- **`APPLICATIONINSIGHTS_CONNECTION_STRING`** turns tracing on. Omit it (with no
+  `OTEL_EXPORTER_OTLP_ENDPOINT` either) and the app runs untraced.
+- **Do not set `ENABLE_SENSITIVE_DATA` in production.** It adds prompts, completions and tool
+  arguments — i.e. governed Databricks data and user questions — to every span.
 
 ### 7b. Enable Microsoft Entra ID authentication (EasyAuth)
 
@@ -354,6 +404,16 @@ Tail logs:
 az containerapp logs show -g $RG -n $APP --follow
 ```
 
+Two UI behaviours worth confirming on first deploy:
+
+- The empty thread shows **starter questions** naming your own subjects, not generic ones.
+  They come from `GET /api/starters` and take about a minute to generate per user on a cold
+  cache. Generic or missing chips mean the agent could not reach any tools — check the
+  Unity Catalog grants for the identity in use.
+- In `obo` mode each answer carries a **"How I got this"** panel with the queries and rows
+  behind it. It is intentionally absent in `app` mode, and it omits the agent's schema-lookup
+  steps — those still run, and the traces record them.
+
 Common issues: **tenant mismatch** (`IncorrectClaimException`), in `obo` mode a **missing
 `user_impersonation` grant / admin consent** or **missing per-user Unity Catalog grants**, in
 `app` mode **missing Unity Catalog grants on the app identity**, or a **missing `Azure AI
@@ -362,6 +422,38 @@ User` role** on Foundry for the model.
 If chats forget previous turns, check the startup log: `Conversation history: Azure Cosmos DB`
 means it is persisting, while `Conversation history is in-memory` means `COSMOS_ENDPOINT` is
 unset. A `403` from Cosmos means the **data-plane** role assignment (§3e) is missing.
+
+### Verify tracing
+
+The startup log prints the destination — `Tracing enabled -> Azure Application Insights`. If
+it says tracing is disabled, no destination env var reached the container; if the line is
+absent, the image was built without the `tracing` extra.
+
+Ask a question, wait a minute or two for ingestion, then query the spans:
+
+```powershell
+$APPI_ID = az monitor app-insights component show -g $RG -a $APPI --query appId -o tsv
+
+az monitor app-insights query --app $APPI_ID --analytics-query @"
+dependencies
+| where timestamp > ago(30m)
+| where name startswith 'chat_turn' or name startswith 'invoke_agent'
+     or name startswith 'execute_tool' or name startswith 'chat '
+| project timestamp, name, duration, success, operation_Id
+| order by timestamp desc
+| take 50
+"@
+```
+
+A healthy turn is one `chat_turn` span (carrying `gen_ai.conversation.id`) with
+`invoke_agent` beneath it, and `chat <model>` plus `execute_tool <name>` spans beneath that.
+That tool sequence is how you confirm the agent actually called `describe_lakebase_table`
+before `query_lakebase`, or that `ask_genie` ran once rather than repeatedly. Group by
+`operation_Id` to see a whole turn together.
+
+For offline scoring of answer quality (intent resolution, task adherence, tool-call accuracy),
+see the **Evaluation** section in [`README.md`](README.md#evaluation). Run it from a
+workstation against the same Foundry project rather than from inside the container.
 
 ---
 
@@ -391,6 +483,14 @@ unset. A `403` from Cosmos means the **data-plane** role assignment (§3e) is mi
   partitioned by the authenticated owner so one user's conversation id cannot reach another's
   history, and set to expire idle conversations after 30 days. Treat stored conversations as
   user data subject to your retention and privacy policy.
+- **Telemetry data** — leave `ENABLE_SENSITIVE_DATA` unset so spans carry no prompts,
+  completions or tool arguments. Chat spans use a hashed `enduser.pseudo.id` instead of the
+  user's Entra object id. Set a retention period on the Log Analytics workspace, and treat any
+  local `evals/output/` files as governed Databricks data (they are git-ignored).
+- **Answer provenance** — the "How I got this" panel returns the queries that ran and the rows
+  they produced. It is served only in `obo` mode, where the caller already has access to those
+  rows under Unity Catalog. Choosing `app` mode suppresses it server-side; do not re-enable it
+  there without deciding that every signed-in user may see every other user's results.
 - **Private networking** — Private Link / VNet integration and IP access lists; ensure egress
   can reach Databricks.
 - **Image hygiene** — pin a base image digest, scan the image, rebuild to pick up patches.

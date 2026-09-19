@@ -21,6 +21,7 @@ Run locally (needs the ``web`` extra: ``pip install -e .[web]``)::
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -30,12 +31,14 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 from uuid import UUID, uuid4
 
 from azure.core.credentials import AccessToken, TokenCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from .agent import build_local_mcp_agent, response_text
@@ -47,6 +50,7 @@ from .auth import (
 from .config import ConfigError, load_settings
 from .conversation_store import ConversationCapacityError, ConversationSessionStore
 from .cosmos_store import ConversationConflictError, CosmosConversationSessionStore
+from .observability import configure_observability
 
 
 # Silence the cosmetic "Can't parse tool." warning: the Agent Framework's generic tool
@@ -60,6 +64,9 @@ class _DropCantParseToolWarning(logging.Filter):
 logging.getLogger("agent_framework").addFilter(_DropCantParseToolWarning())
 
 logger = logging.getLogger("foundry_databricks_agent.webapp")
+
+# Resolves lazily, so the provider configured at startup is the one that gets used.
+_tracer = trace.get_tracer("foundry_databricks_agent.webapp")
 
 # Populate WEBAPP_* (and model settings) from a local .env for development runs. Real
 # environment variables take precedence, so containers/production are unaffected.
@@ -139,6 +146,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _CONVERSATIONS
 
     settings = load_settings()
+    # Before any agent runs, so the Agent Framework's instrumentation is active for them.
+    configure_observability(settings)
+
     if settings.cosmos_enabled:
         settings.validate_cosmos()
         _CONVERSATIONS = CosmosConversationSessionStore(
@@ -241,6 +251,25 @@ def _conversation_owner(request: Request, assertion: str | None) -> str:
     if _LOCAL_DEV:
         return "local-dev"
     raise HTTPException(status_code=401, detail="Not signed in.")
+
+
+def _conversation_span(conversation_id: str, owner_id: str):
+    """Open the span the agent's own spans nest under, carrying conversation identity.
+
+    This span is created here rather than relying on an HTTP server span: FastAPI is only
+    auto-instrumented on the Application Insights path, so without it the correlation would
+    silently vanish whenever traces go to an OTLP collector or the console.
+
+    The owner key is hashed so telemetry carries a stable correlation id rather than the
+    signed-in user's Entra object id.
+    """
+    return _tracer.start_as_current_span(
+        "chat_turn",
+        attributes={
+            "gen_ai.conversation.id": conversation_id,
+            "enduser.pseudo.id": hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:32],
+        },
+    )
 
 
 def _user_databricks_credential(assertion: str | None) -> TokenCredential:
@@ -425,8 +454,260 @@ async def reset_conversation(request: Request, conversation_id: UUID) -> Respons
     return Response(status_code=204)
 
 
+# The provenance panel names the real systems on purpose: it exists to be audited, unlike
+# the answer text, which stays in business language.
+_TOOL_LABELS = {
+    "list_lakebase_tables": "Lakebase — listed available tables",
+    "describe_lakebase_table": "Lakebase — described table",
+    "query_lakebase": "Lakebase — ran SQL query",
+    "ask_genie": "Genie — asked a question",
+}
+
+_STEP_DETAIL_LIMIT = 800
+_STEP_RESULT_LIMIT = 900
+
+# Schema lookups the agent runs before writing SQL; hidden unless they are the whole answer.
+_DISCOVERY_TOOLS = {"list_lakebase_tables", "describe_lakebase_table"}
+
+
+def _uc_function_name(name: str) -> str:
+    """Unity Catalog functions arrive from managed MCP as catalog__schema__function."""
+    return name.rsplit("__", 1)[-1]
+
+
+def _tool_label(name: str) -> str:
+    if name in _TOOL_LABELS:
+        return _TOOL_LABELS[name]
+    if "__" in name:
+        return f"Called UC function {_uc_function_name(name)}"
+    return f"Called {name}" if name else "Called a tool"
+
+
+def _as_mapping(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _step_detail(name: str, arguments: Any) -> tuple[str, str]:
+    """What was sent, as ``(kind, text)``; kind tells the UI whether to show it as code."""
+    arguments = _as_mapping(arguments)
+    if isinstance(arguments, str):
+        return "text", arguments[:_STEP_DETAIL_LIMIT]
+    if not isinstance(arguments, dict) or not arguments:
+        return "text", ""
+    sql = arguments.get("sql")
+    if isinstance(sql, str) and sql.strip():
+        return "sql", sql.strip()[:_STEP_DETAIL_LIMIT]
+    for key in ("question", "query"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return "question", value.strip()[:_STEP_DETAIL_LIMIT]
+    schema, table = arguments.get("table_schema"), arguments.get("table_name")
+    if isinstance(table, str) and table:
+        name_text = f"{schema}.{table}" if isinstance(schema, str) and schema else table
+        return "code", name_text
+    if "__" in name:
+        params = ", ".join(
+            f"{key}={json.dumps(value, default=str)}" for key, value in arguments.items()
+        )
+        return "code", f"{_uc_function_name(name)}({params})"[:_STEP_DETAIL_LIMIT]
+    return "code", json.dumps(arguments, default=str)[:_STEP_DETAIL_LIMIT]
+
+
+def _dedupe_json_lines(text: str) -> str:
+    """Drop repeated JSON payloads.
+
+    MCP tool results arrive as the raw payload followed by a re-serialised copy of the same
+    object, which differ only in spacing. Only lines that parse as JSON are compared, so
+    genuinely identical table rows are never collapsed.
+    """
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return text
+    seen: set[str] = set()
+    kept: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        key = None
+        if stripped.startswith(("{", "[")):
+            try:
+                key = json.dumps(json.loads(stripped), sort_keys=True)
+            except (json.JSONDecodeError, ValueError):
+                key = None
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _as_table(payload: Any) -> str | None:
+    """Render a Databricks ``{columns, rows}`` payload the way SQL results are already shown."""
+    if not isinstance(payload, dict):
+        return None
+    columns, rows = payload.get("columns"), payload.get("rows")
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return None
+    lines = [" | ".join(str(column) for column in columns)]
+    for row in rows:
+        cells = row if isinstance(row, list) else [row]
+        lines.append(" | ".join("" if cell is None else str(cell) for cell in cells))
+    if payload.get("is_truncated"):
+        lines.append("... result truncated")
+    return "\n".join(lines)
+
+
+def _readable(line: str) -> str:
+    """Turn a raw JSON payload into something a reviewer can scan."""
+    stripped = line.strip()
+    if not stripped.startswith(("{", "[")):
+        return line
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return line
+    table = _as_table(payload)
+    if table is not None:
+        return table
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _flatten_result(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (list, tuple)):
+        return "\n".join(_flatten_result(item) for item in result)
+    text = getattr(result, "text", None)
+    if isinstance(text, str):
+        return text
+    return "" if result is None else str(result)
+
+
+def _result_text(result: Any) -> str:
+    text = _dedupe_json_lines(_flatten_result(result))
+    return "\n".join(_readable(line) for line in text.splitlines())
+
+
+def _turn_steps(messages: list[Any]) -> list[dict[str, str]]:
+    """Summarise the tool calls behind one answer, in the order they ran."""
+    steps: dict[str, dict[str, str]] = {}
+    tools: dict[str, str] = {}
+    order: list[str] = []
+    for message in messages:
+        for content in getattr(message, "contents", None) or []:
+            kind = getattr(content, "type", None)
+            call_id = getattr(content, "call_id", None) or ""
+            if kind == "function_call":
+                key = call_id or f"step-{len(order)}"
+                name = content.name or ""
+                detail_kind, detail = _step_detail(name, content.arguments)
+                steps[key] = {
+                    "label": _tool_label(name),
+                    "kind": detail_kind,
+                    "detail": detail,
+                    "result": "",
+                }
+                tools[key] = name
+                order.append(key)
+            elif kind == "function_result" and call_id in steps:
+                text = _result_text(getattr(content, "result", None)).strip()
+                if len(text) > _STEP_RESULT_LIMIT:
+                    # Say so, otherwise a cut-off table reads as the complete result.
+                    text = text[:_STEP_RESULT_LIMIT].rstrip() + "\n… result truncated for display"
+                steps[call_id]["result"] = text
+
+    answering = [key for key in order if tools[key] not in _DISCOVERY_TOOLS]
+    # Discovery is scaffolding for writing the query; the query is what needs checking. Keep
+    # it only when nothing else ran, so a pure schema question still shows its work.
+    return [steps[key] for key in (answering or order)]
+
+
+def _visible_steps(messages: list[Any]) -> list[dict[str, str]]:
+    """Provenance for this turn, but only where the caller owns the data it exposes.
+
+    In ``obo`` mode the steps only ever replay what Unity Catalog already let this user
+    read. In ``app`` mode every caller shares the app's permissions, so returning queries
+    and result rows would hand one user's data to everyone — the panel is withheld.
+    """
+    if _SHARED_IDENTITY:
+        return []
+    return _turn_steps(messages)
+
+
+STARTER_PROMPT = (
+    "Suggest four example questions a business user could ask you. First look at what data "
+    "you can actually reach, so the questions refer to real subjects rather than invented "
+    "ones. Vary them: at least one that looks up a single record and at least two that "
+    "analyse or compare. Each must be under 70 characters, in plain business language, "
+    "naming no system, table or column. Reply with only a JSON array of four strings."
+)
+
+# Per-owner because Unity Catalog governs visibility per user: two users can legitimately
+# see different data and so deserve different suggestions.
+_STARTERS: dict[str, list[str]] = {}
+_STARTERS_LOCK = asyncio.Lock()
+_STARTERS_MAX_OWNERS = 500
+
+
+def _parse_starters(text: str) -> list[str]:
+    """Pull the JSON array of questions out of the model's reply."""
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item.strip() for item in parsed if isinstance(item, str) and item.strip()][:4]
+
+
+async def _generate_starters(assertion: str | None) -> list[str]:
+    """Ask the agent itself what it can answer, so suggestions match the live tools."""
+    settings = load_settings()
+    credential = _user_databricks_credential(assertion)
+    async with build_local_mcp_agent(settings, databricks_credential=credential) as agent:
+        result = await agent.run(STARTER_PROMPT)
+    return _parse_starters(response_text(result))
+
+
+@app.get("/api/starters")
+async def starters(request: Request) -> dict[str, list[str]]:
+    """Example questions derived from the tools and schema this caller can actually reach."""
+    assertion = _user_assertion(request)
+    if not assertion and not _LOCAL_DEV:
+        return {"starters": []}
+    # In shared mode every user reaches the same data, so one generation serves everyone.
+    owner_id = "app" if _SHARED_IDENTITY else _conversation_owner(request, assertion)
+
+    cached = _STARTERS.get(owner_id)
+    if cached is not None:
+        return {"starters": cached}
+
+    async with _STARTERS_LOCK:
+        cached = _STARTERS.get(owner_id)
+        if cached is not None:
+            return {"starters": cached}
+        try:
+            questions = await _generate_starters(assertion)
+        except Exception:  # noqa: BLE001 - suggestions are optional; never break the page
+            logger.exception("could not generate starter questions")
+            questions = []
+        if len(_STARTERS) >= _STARTERS_MAX_OWNERS:
+            _STARTERS.clear()
+        _STARTERS[owner_id] = questions
+
+    return {"starters": questions}
+
+
 @app.post("/api/chat")
-async def chat(request: Request, body: ChatRequest) -> dict[str, str]:
+async def chat(request: Request, body: ChatRequest) -> dict[str, Any]:
     assertion = _user_assertion(request)
     if not assertion and not _LOCAL_DEV:
         raise HTTPException(
@@ -442,39 +723,43 @@ async def chat(request: Request, body: ChatRequest) -> dict[str, str]:
     conversation_id = str(body.conversation_id or uuid4())
     owner_id = _conversation_owner(request, assertion)
 
-    try:
-        settings = load_settings()
-        credential = _user_databricks_credential(assertion)
-        logger.info(
-            "Running Databricks tools as %s (mode=%s)",
-            "the app identity" if _SHARED_IDENTITY else _user_name(request),
-            _DATABRICKS_IDENTITY,
-        )
-        async with _CONVERSATIONS.session(owner_id, conversation_id) as agent_session:
-            async with build_local_mcp_agent(
-                settings,
-                databricks_credential=credential,
-                conversation_state=agent_session.state,
-            ) as agent:
-                result = await agent.run(question, session=agent_session)
-    except ConfigError as exc:
-        raise HTTPException(status_code=500, detail=f"Configuration error: {exc}") from exc
-    except ConversationCapacityError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except ConversationConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
-        logger.exception("agent run failed for %s", _user_name(request))
-        raise HTTPException(status_code=502, detail=f"Agent error: {exc}") from exc
+    with _conversation_span(conversation_id, owner_id):
+        try:
+            settings = load_settings()
+            credential = _user_databricks_credential(assertion)
+            logger.info(
+                "Running Databricks tools as %s (mode=%s)",
+                "the app identity" if _SHARED_IDENTITY else _user_name(request),
+                _DATABRICKS_IDENTITY,
+            )
+            async with _CONVERSATIONS.session(owner_id, conversation_id) as agent_session:
+                async with build_local_mcp_agent(
+                    settings,
+                    databricks_credential=credential,
+                    conversation_state=agent_session.state,
+                ) as agent:
+                    result = await agent.run(question, session=agent_session)
+        except ConfigError as exc:
+            raise HTTPException(status_code=500, detail=f"Configuration error: {exc}") from exc
+        except ConversationCapacityError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - surface a clean error to the UI
+            logger.exception("agent run failed for %s", _user_name(request))
+            raise HTTPException(status_code=502, detail=f"Agent error: {exc}") from exc
 
     return {
         "user": _user_name(request),
         "answer": response_text(result),
         "conversation_id": conversation_id,
+        "steps": _visible_steps(list(getattr(result, "messages", None) or [])),
     }
 
 
-_INDEX_HTML = """<!doctype html>
+# Raw: the embedded CSS and JS own their backslashes (regex escapes, \n, \u2019), so Python
+# must not reinterpret them.
+_INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -562,6 +847,63 @@ _INDEX_HTML = """<!doctype html>
     }
     .row.agent .bubble { background: var(--agent-bubble); border-top-left-radius: 4px; }
     .row.you .bubble { background: var(--accent); color: var(--accent-contrast); border-top-right-radius: 4px; }
+    .row.agent .bubble-wrap { max-width: min(92%, 800px); }
+    .bubble.md { white-space: normal; }
+    .bubble.md > *:first-child { margin-top: 0; }
+    .bubble.md > *:last-child { margin-bottom: 0; }
+    .bubble.md p { margin: 0 0 9px; }
+    .bubble.md h3, .bubble.md h4, .bubble.md h5, .bubble.md h6 {
+      margin: 13px 0 6px; font-size: 14.5px; font-weight: 650; line-height: 1.3;
+    }
+    .bubble.md ul, .bubble.md ol { margin: 0 0 9px; padding-left: 21px; }
+    .bubble.md li { margin: 3px 0; }
+    .bubble.md code {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px;
+      padding: 1px 4px; font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12.5px;
+    }
+    .bubble.md pre {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 9px 11px; margin: 0 0 9px; overflow-x: auto;
+    }
+    .bubble.md pre code { background: none; border: 0; padding: 0; }
+    .tablewrap { overflow-x: auto; margin: 2px 0 9px; }
+    .bubble.md table { border-collapse: collapse; font-size: 13px; }
+    .bubble.md th, .bubble.md td {
+      border: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top;
+      white-space: nowrap;
+    }
+    .bubble.md th { background: var(--panel-2); font-weight: 650; }
+    .steps { margin: 6px 4px 0; font-size: 12px; }
+    .steps > summary {
+      cursor: pointer; color: var(--muted); user-select: none; list-style: none;
+      padding: 3px 0;
+    }
+    .steps > summary::-webkit-details-marker { display: none; }
+    .steps > summary::before { content: '▸  '; }
+    .steps[open] > summary::before { content: '▾  '; }
+    .steps > summary:hover { color: var(--text); }
+    .step {
+      border-left: 2px solid var(--border); margin: 9px 0 0; padding: 0 0 0 11px;
+    }
+    .step .step-label { color: var(--text); font-weight: 600; }
+    .step .cap {
+      color: var(--muted); font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+      margin: 7px 0 3px;
+    }
+    .step pre {
+      margin: 0; padding: 7px 9px; background: var(--panel-2);
+      border: 1px solid var(--border); border-radius: 7px; overflow-x: auto;
+      font-family: Consolas, "SF Mono", Menlo, monospace; font-size: 12px;
+      white-space: pre; color: var(--text);
+    }
+    .step .prose { font-size: 12.5px; line-height: 1.5; color: var(--text); }
+    .step .prose + .prose { margin-top: 4px; }
+    .step table { border-collapse: collapse; font-size: 11.5px; }
+    .step th, .step td {
+      border: 1px solid var(--border); padding: 3px 8px; text-align: left;
+      white-space: nowrap; color: var(--text);
+    }
+    .step th { background: var(--panel-2); font-weight: 650; }
     .row.err .bubble { background: var(--err-bg); color: var(--err-text); }
 
     .typing { display: inline-flex; gap: 4px; align-items: center; padding: 3px 2px; }
@@ -614,7 +956,7 @@ _INDEX_HTML = """<!doctype html>
       <div class="logo">DB</div>
       <div>
         <div class="title">Azure Databricks agent</div>
-        <div class="subtitle" id="subtitle">Governed by Unity Catalog</div>
+        <div class="subtitle" id="subtitle">Answers limited to your permissions</div>
       </div>
     </div>
     <div class="who">
@@ -629,13 +971,9 @@ _INDEX_HTML = """<!doctype html>
     <div class="thread" id="thread">
       <div class="welcome" id="welcome">
         <h1>How can I help?</h1>
-        <p>Ask about your governed lakehouse data. I use Unity Catalog functions and Genie
-           under your own identity.</p>
-        <div class="suggestions" id="suggestions">
-          <button class="chip" type="button">What Unity Catalog functions can you run?</button>
-          <button class="chip" type="button">What can the Genie space answer?</button>
-          <button class="chip" type="button">How many orders shipped last week?</button>
-        </div>
+        <p>Ask about your data in plain language. You only ever see what your own
+           permissions allow.</p>
+        <div class="suggestions" id="suggestions"></div>
       </div>
     </div>
   </main>
@@ -675,7 +1013,122 @@ _INDEX_HTML = """<!doctype html>
     function scrollDown() { main.scrollTop = main.scrollHeight; }
     function dismissWelcome() { if (welcome && welcome.parentNode) welcome.remove(); }
 
-    function addMessage(text, who) {
+    // Minimal Markdown renderer. Answers restate untrusted tool data, so every value reaches
+    // the DOM as a text node — nothing here ever assigns HTML.
+    const INLINE = /(\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|`[^`]+`)/g;
+
+    function renderInline(text, parent) {
+      let last = 0, m;
+      INLINE.lastIndex = 0;
+      while ((m = INLINE.exec(text)) !== null) {
+        if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const token = m[0];
+        let el, inner;
+        if (token.startsWith('**') || token.startsWith('__')) {
+          el = document.createElement('strong'); inner = token.slice(2, -2);
+        } else if (token.startsWith('`')) {
+          el = document.createElement('code'); inner = token.slice(1, -1);
+        } else {
+          el = document.createElement('em'); inner = token.slice(1, -1);
+        }
+        el.textContent = inner;
+        parent.appendChild(el);
+        last = m.index + token.length;
+      }
+      if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+    }
+
+    const cellsOf = (line) =>
+      line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+    const isTableRule = (line) =>
+      line != null && line.includes('-') && /^[\s:|-]+$/.test(line) && line.includes('|');
+    const listItem = (line) => line.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
+
+    function renderMarkdown(text, root) {
+      const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+      const para = [];
+      let i = 0;
+
+      function flush() {
+        if (!para.length) return;
+        const p = document.createElement('p');
+        renderInline(para.join(' '), p);
+        root.appendChild(p);
+        para.length = 0;
+      }
+
+      while (i < lines.length) {
+        const line = lines[i];
+
+        if (/^\s*```/.test(line)) {
+          flush();
+          const code = [];
+          i++;
+          while (i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i++]);
+          i++;
+          const pre = document.createElement('pre');
+          const c = document.createElement('code');
+          c.textContent = code.join('\n');
+          pre.appendChild(c); root.appendChild(pre);
+          continue;
+        }
+
+        if (/^\s*\|/.test(line) && isTableRule(lines[i + 1])) {
+          flush();
+          const wrap = document.createElement('div');
+          wrap.className = 'tablewrap';
+          const table = document.createElement('table');
+          const thead = document.createElement('thead');
+          const headRow = document.createElement('tr');
+          for (const cell of cellsOf(line)) {
+            const th = document.createElement('th');
+            renderInline(cell, th); headRow.appendChild(th);
+          }
+          thead.appendChild(headRow); table.appendChild(thead);
+          i += 2;
+          const tbody = document.createElement('tbody');
+          while (i < lines.length && /^\s*\|/.test(lines[i])) {
+            const tr = document.createElement('tr');
+            for (const cell of cellsOf(lines[i])) {
+              const td = document.createElement('td');
+              renderInline(cell, td); tr.appendChild(td);
+            }
+            tbody.appendChild(tr); i++;
+          }
+          table.appendChild(tbody); wrap.appendChild(table); root.appendChild(wrap);
+          continue;
+        }
+
+        const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
+        if (heading) {
+          flush();
+          const el = document.createElement('h' + Math.min(heading[1].length + 2, 6));
+          renderInline(heading[2], el); root.appendChild(el); i++;
+          continue;
+        }
+
+        const item = listItem(line);
+        if (item) {
+          flush();
+          const ordered = /\d/.test(item[1]);
+          const list = document.createElement(ordered ? 'ol' : 'ul');
+          while (i < lines.length) {
+            const next = listItem(lines[i]);
+            if (!next || /\d/.test(next[1]) !== ordered) break;
+            const li = document.createElement('li');
+            renderInline(next[2], li); list.appendChild(li); i++;
+          }
+          root.appendChild(list);
+          continue;
+        }
+
+        if (!line.trim()) { flush(); i++; continue; }
+        para.push(line.trim()); i++;
+      }
+      flush();
+    }
+
+    function addMessage(text, who, steps) {
       dismissWelcome();
       const row = document.createElement('div');
       row.className = 'row ' + who;
@@ -689,12 +1142,110 @@ _INDEX_HTML = """<!doctype html>
       meta.textContent = (who === 'you' ? 'You' : who === 'err' ? 'Error' : 'Agent') + ' · ' + now();
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
-      bubble.textContent = text;
+      if (who === 'agent') { bubble.classList.add('md'); renderMarkdown(text, bubble); }
+      else bubble.textContent = text;
       wrap.appendChild(meta); wrap.appendChild(bubble);
+      if (Array.isArray(steps) && steps.length) wrap.appendChild(buildSteps(steps));
       row.appendChild(avatar); row.appendChild(wrap);
       thread.appendChild(row);
       scrollDown();
       return row;
+    }
+
+    // Every value here is tool output, so it is set with textContent and never as HTML.
+    function buildSteps(steps) {
+      const details = document.createElement('details');
+      details.className = 'steps';
+      const summary = document.createElement('summary');
+      summary.textContent = steps.length === 1
+        ? 'How I got this · 1 step'
+        : 'How I got this · ' + steps.length + ' steps';
+      details.appendChild(summary);
+      steps.forEach((step, i) => {
+        const box = document.createElement('div');
+        box.className = 'step';
+        const label = document.createElement('div');
+        label.className = 'step-label';
+        label.textContent = (i + 1) + '. ' + (step.label || 'Step');
+        box.appendChild(label);
+        if (step.detail) {
+          box.appendChild(caption('Sent'));
+          if (step.kind === 'question') {
+            const p = document.createElement('div');
+            p.className = 'prose';
+            p.textContent = step.detail;
+            box.appendChild(p);
+          } else {
+            const pre = document.createElement('pre');
+            pre.textContent = step.detail;
+            box.appendChild(pre);
+          }
+        }
+        if (step.result) {
+          box.appendChild(caption('Returned'));
+          renderResult(step.result, box);
+        }
+        details.appendChild(box);
+      });
+      return details;
+    }
+
+    function caption(text) {
+      const el = document.createElement('div');
+      el.className = 'cap';
+      el.textContent = text;
+      return el;
+    }
+
+    // Tool results are pipe-delimited tables mixed with prose. Wrapping them in a <pre>
+    // breaks column alignment on wide rows, so the tabular parts become real tables.
+    const isPipeRow = (line) => line.split('|').length > 1 && line.trim() !== '';
+
+    function renderResult(text, parent) {
+      const lines = String(text).split('\n');
+      let i = 0;
+      while (i < lines.length) {
+        const block = [];
+        const tabular = isPipeRow(lines[i]);
+        while (i < lines.length && isPipeRow(lines[i]) === tabular) block.push(lines[i++]);
+        if (tabular && block.length >= 2) appendResultTable(block, parent);
+        else appendProse(block, parent);
+      }
+    }
+
+    function appendResultTable(rows, parent) {
+      const wrap = document.createElement('div');
+      wrap.className = 'tablewrap';
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const cell of rows[0].split('|')) {
+        const th = document.createElement('th');
+        th.textContent = cell.trim();
+        headRow.appendChild(th);
+      }
+      thead.appendChild(headRow); table.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      for (const row of rows.slice(1)) {
+        const tr = document.createElement('tr');
+        for (const cell of row.split('|')) {
+          const td = document.createElement('td');
+          td.textContent = cell.trim();
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody); wrap.appendChild(table); parent.appendChild(wrap);
+    }
+
+    function appendProse(lines, parent) {
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const el = document.createElement('div');
+        el.className = 'prose';
+        renderInline(line.trim(), el);
+        parent.appendChild(el);
+      }
     }
 
     function addTyping() {
@@ -718,8 +1269,8 @@ _INDEX_HTML = """<!doctype html>
     fetch('/api/me').then(r => r.json()).then(m => {
       signedIn = !!m.signedIn;
       if (subtitle) subtitle.textContent = m.mode === 'app'
-        ? 'Governed by Unity Catalog · Databricks runs as the app (shared)'
-        : 'Governed by Unity Catalog · Databricks runs as you (per-user)';
+        ? 'Answers limited to the app\u2019s shared permissions'
+        : 'Answers limited to your own permissions';
       if (signedIn) {
         statusPill.classList.add('on');
         whoName.textContent = m.name || 'Signed in';
@@ -728,6 +1279,7 @@ _INDEX_HTML = """<!doctype html>
         }
         newChat.disabled = false;
         setEnabled(true); q.focus();
+        loadStarters();
       } else {
         whoName.textContent = 'Not signed in';
         if (m.interactive) {
@@ -747,6 +1299,23 @@ _INDEX_HTML = """<!doctype html>
       if (!chip || !signedIn) return;
       q.value = chip.textContent.trim(); autoGrow(); q.focus();
     });
+
+    // Suggestions come from the agent inspecting its own tools and schema, so they match
+    // whatever this deployment can actually answer for this user.
+    function loadStarters() {
+      const box = document.getElementById('suggestions');
+      if (!box) return;
+      fetch('/api/starters').then(r => r.json()).then(d => {
+        const items = Array.isArray(d.starters) ? d.starters : [];
+        for (const question of items) {
+          const chip = document.createElement('button');
+          chip.className = 'chip';
+          chip.type = 'button';
+          chip.textContent = question;
+          box.appendChild(chip);
+        }
+      }).catch(() => {});
+    }
 
     newChat.addEventListener('click', async () => {
       const previous = conversationId;
@@ -779,12 +1348,15 @@ _INDEX_HTML = """<!doctype html>
             conversationId = data.conversation_id;
             localStorage.setItem('fdba_conversation_id', conversationId);
           }
-          addMessage(data.answer || '(no answer)', 'agent');
+          addMessage(data.answer || '(no answer)', 'agent', data.steps);
         }
         else addMessage(data.detail || r.statusText || 'Request failed', 'err');
       } catch (err) {
         typing.remove();
-        addMessage(String(err), 'err');
+        // fetch() rejects with a bare TypeError when the server cannot be reached at all.
+        addMessage(err instanceof TypeError
+          ? 'Cannot reach the server. Check that the app is still running, then try again.'
+          : String(err), 'err');
       } finally {
         setEnabled(true); q.focus();
       }

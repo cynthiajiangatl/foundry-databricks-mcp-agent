@@ -34,6 +34,9 @@ param keyVaultName string
 @description('Application Insights connection string (not a secret).')
 param appInsightsConnectionString string
 
+@description('Service name reported on OpenTelemetry traces.')
+param otelServiceName string = 'foundry-databricks-agent'
+
 @description('Entra tenant ID used by EasyAuth and the OBO exchange.')
 param authTenantId string
 
@@ -46,6 +49,12 @@ param databricksHost string
 param databricksUcCatalog string
 param databricksUcSchema string
 param databricksGenieSpaceId string
+
+@description('Lakebase endpoint resource name (projects/<p>/branches/<b>/endpoints/<e>). Empty disables the Lakebase tools.')
+param databricksLakebaseEndpoint string = ''
+
+@description('Lakebase Postgres hostname. Empty disables the Lakebase tools.')
+param databricksLakebaseHost string = ''
 
 @description('Cosmos DB account endpoint holding conversation history.')
 param cosmosEndpoint string
@@ -148,6 +157,14 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = {
               value: databricksGenieSpaceId
             }
             {
+              name: 'DATABRICKS_LAKEBASE_ENDPOINT'
+              value: databricksLakebaseEndpoint
+            }
+            {
+              name: 'DATABRICKS_LAKEBASE_HOST'
+              value: databricksLakebaseHost
+            }
+            {
               name: 'WEBAPP_DATABRICKS_IDENTITY'
               value: databricksIdentityMode
             }
@@ -174,6 +191,10 @@ resource containerApp 'Microsoft.App/containerApps@2026-01-01' = {
             {
               name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
               value: appInsightsConnectionString
+            }
+            {
+              name: 'OTEL_SERVICE_NAME'
+              value: otelServiceName
             }
             {
               name: 'COSMOS_ENDPOINT'

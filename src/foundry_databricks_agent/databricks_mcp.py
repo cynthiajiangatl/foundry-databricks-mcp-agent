@@ -74,7 +74,10 @@ def make_uc_functions_local_mcp_tool(
         name="databricks_uc_functions",
         url=settings.uc_functions_mcp_url,
         description=(
-            f"Run Unity Catalog functions in {settings.uc_catalog}.{settings.uc_schema}."
+            "Governed Unity Catalog functions for targeted lookups and custom logic "
+            f"({settings.uc_catalog}.{settings.uc_schema}). Prefer one of these when its "
+            "description matches the request — they are cheaper and more precise than "
+            "running analytics or SQL."
         ),
         settings=settings,
         credential=credential,

@@ -21,3 +21,8 @@ env/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Evaluation runs: agent responses and scores (may contain governed Databricks data)
+evals/output/
+# Azure AI Evaluation / promptflow local run artifacts
+.promptflow/

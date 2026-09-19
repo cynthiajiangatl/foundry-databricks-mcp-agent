@@ -177,9 +177,12 @@ def make_genie_tool(
     return FunctionTool(
         name="ask_genie",
         description=(
-            "Ask the governed Genie space a natural-language analytics question about the "
-            "lakehouse data. Waits for the answer and returns it, and automatically "
-            "continues the same Genie conversation across follow-up questions."
+            "Answer an analytical question over the governed lakehouse data: aggregates, "
+            "breakdowns by dimension, trends over time and comparisons across periods or "
+            "segments. Ask in plain business language about entities, metrics and time "
+            "ranges — never name a tool, product or database in the question, because those "
+            "words are matched against column values and return nothing. Waits for the "
+            "answer and continues the same Genie conversation across follow-up questions."
         ),
         func=ask_genie,
     )

@@ -22,6 +22,9 @@ aiohttp>=3.10.0
 # carry the Entra ID OAuth bearer token on the local MCP transport.
 httpx>=0.27.0
 
+# Lakebase (Databricks OLTP Postgres) read-only query tools.
+psycopg[binary]>=3.2
+
 # Local configuration via .env files.
 python-dotenv>=1.0.1
 
@@ -31,3 +34,11 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 # Interactive Entra ID sign-in (auth-code flow) for local browser testing of the web UI.
 msal>=1.28.0
+
+# OpenTelemetry export of agent, model and tool spans (foundry_databricks_agent.observability).
+# Equivalent to the `tracing` extra: pip install .[tracing]
+azure-monitor-opentelemetry>=1.6.0
+opentelemetry-exporter-otlp-proto-grpc>=1.27.0
+
+# Offline agent evaluation (evals/). Equivalent to the `evals` extra: pip install .[evals]
+azure-ai-evaluation>=1.13.0

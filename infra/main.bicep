@@ -41,6 +41,12 @@ param databricksUcCatalog string = 'adbwscj1'
 param databricksUcSchema string = 'dbdemos_aibi_customer_support'
 param databricksGenieSpaceId string = '01f1808744811fc78f0b82f240444c19'
 
+@description('Lakebase endpoint resource name. Empty disables the Lakebase tools.')
+param databricksLakebaseEndpoint string = ''
+
+@description('Lakebase Postgres hostname. Empty disables the Lakebase tools.')
+param databricksLakebaseHost string = ''
+
 // Names come verbatim from prepare-plan.json.naming.resources — do not derive.
 param resourceGroupName string = 'rg-foundry-dev-19e5'
 param containerAppName string = 'ca-foundry-dev-19e5'
@@ -176,6 +182,8 @@ module containerApp './modules/container-app.bicep' = {
     databricksUcCatalog: databricksUcCatalog
     databricksUcSchema: databricksUcSchema
     databricksGenieSpaceId: databricksGenieSpaceId
+    databricksLakebaseEndpoint: databricksLakebaseEndpoint
+    databricksLakebaseHost: databricksLakebaseHost
     databricksIdentityMode: 'obo'
     cosmosEndpoint: cosmos.outputs.endpoint
     cosmosDatabase: cosmos.outputs.databaseName
@@ -196,6 +204,8 @@ output AZURE_CONTAINER_APP_URI string = containerApp.outputs.uri
 output AZURE_KEY_VAULT_NAME string = keyVault.outputs.name
 output AZURE_COSMOS_ACCOUNT_NAME string = cosmos.outputs.accountName
 output AZURE_COSMOS_ENDPOINT string = cosmos.outputs.endpoint
+output AZURE_APP_INSIGHTS_NAME string = appInsights.outputs.name
+output AZURE_LOG_ANALYTICS_WORKSPACE_NAME string = logAnalytics.outputs.name
 output AZURE_MANAGED_IDENTITY_NAME string = managedIdentity.outputs.name
 output AZURE_MANAGED_IDENTITY_CLIENT_ID string = managedIdentity.outputs.clientId
 output AZURE_MANAGED_IDENTITY_PRINCIPAL_ID string = managedIdentity.outputs.principalId

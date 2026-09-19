@@ -18,6 +18,7 @@ dependencies = [
     "mcp>=1.13.0",
     "aiohttp>=3.10.0",
     "httpx>=0.27.0",
+    "psycopg[binary]>=3.2",
     "python-dotenv>=1.0.1",
 ]
 
@@ -28,6 +29,19 @@ web = [
     "uvicorn[standard]>=0.30.0",
     # Optional: interactive Entra ID sign-in for local browser testing (auth-code flow).
     "msal>=1.28.0",
+]
+
+# OpenTelemetry export of agent/model/tool spans. Install with: pip install .[tracing]
+tracing = [
+    # Application Insights exporter; also instruments FastAPI and outbound HTTP.
+    "azure-monitor-opentelemetry>=1.6.0",
+    # OTLP export to a collector or the Foundry Toolkit trace viewer in VS Code.
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+]
+
+# Offline agent evaluation (evals/). Install with: pip install .[evals]
+evals = [
+    "azure-ai-evaluation>=1.13.0",
 ]
 
 [tool.setuptools.packages.find]
